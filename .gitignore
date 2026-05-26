@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+avature_jobs.db
+scraped_jobs.csv
+scraped_jobs.json
+validated_targets.json
