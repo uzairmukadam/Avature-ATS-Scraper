@@ -61,6 +61,10 @@ def setup_database(db_path="avature_jobs.db"):
         cursor.execute("ALTER TABLE jobs ADD COLUMN raw_html TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN salary TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -139,6 +143,30 @@ def clean_job_title(title, domain=None, ref_id=None, department=None):
     
     return title or "Unknown Title"
 
+def extract_salary_from_text(text: str) -> str:
+    if not text:
+        return "Unknown"
+        
+    # Pattern 1: $15 - $25 / hour or $50,000 - $80,000 a year or £13.28 an hour or €3.000 / month
+    pattern = r'(?:[\$£€]\s*\d+(?:\.\d+)?(?:,\d{3})*(?:\.\d{2})?\s*(?:-|to)\s*)?[\$£€]\s*\d+(?:\.\d+)?(?:,\d{3})*(?:\.\d{2})?\s*(?:per\s+|/|\ban?\s+)?(?:hour|hr|hourly|yr|year|annually|annum|month|mo|weekly|wk)\b'
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        return match.group(0).strip()
+        
+    # Pattern 2: $30.56 - 60.82 Hourly
+    pattern_hourly2 = r'[\$£€]\s*\d+(?:\.\d+)?\s*(?:-|to)\s*\d+(?:\.\d+)?\s*(?:hour|hr|hourly)\b'
+    match_hourly2 = re.search(pattern_hourly2, text, re.IGNORECASE)
+    if match_hourly2:
+        return match_hourly2.group(0).strip()
+    
+    # Pattern 3: simple currency ranges like "$100,000 - $120,000" or "£35,000 - £45,000"
+    pattern_range = r'[\$£€]\s*\d{2,}(?:,\d{3})*(?:\.\d{2})?\s*(?:-|to)\s*[\$£€]\s*\d{2,}(?:,\d{3})*(?:\.\d{2})?'
+    match_range = re.search(pattern_range, text)
+    if match_range:
+        return match_range.group(0).strip()
+        
+    return "Unknown"
+
 def parse_job_details(html: str, job_url: str, domain: str):
     """
     Parses Avature JobDetail pages to extract Title, clean Description, 
@@ -146,33 +174,83 @@ def parse_job_details(html: str, job_url: str, domain: str):
     Supports Bloomberg/Standard, NVA/Standard, and Mettler Toledo/Standard templates.
     """
     import copy
+    import json
     soup = BeautifulSoup(html, "html.parser")
     
-    # 1. Extract Job Title
-    title = "Unknown Title"
-    title_tag = soup.find("title")
-    if title_tag:
-        title = title_tag.text.strip()
-        
-    h1_tag = soup.find("h1") or soup.find(class_=lambda x: x and "job-title" in x.lower())
-    if h1_tag and (title == "Unknown Title" or not title):
-        title = h1_tag.text.strip()
-        
-    # 2. Extract Metadata Key-Value pairs dynamically (covering multiple layouts)
+    # 1. Collect all key-value pairs (metadata) and large text fields dynamically
     metadata = {}
+    description_blocks = []
+    seen_desc_texts = set()
     
-    # --- Layout 1: article__content__view__field (Bloomberg / Standard) ---
-    field_elements = soup.find_all(class_=lambda x: x and "article__content__view__field" in x)
+    # --- Pattern 1: Class-Suffix Prefix Scanner (e.g. jobDetailTableLocation or jobDetailDescription) ---
+    for item in soup.find_all(class_=lambda x: x and any(k in x.lower() for k in ["jobdetailtable", "jobdetail_"])):
+        cls_list = item.get("class")
+        for c in cls_list:
+            c_lower = c.lower()
+            if "jobdetaildescription" in c_lower or "jobdetailtabledescription" in c_lower:
+                txt = item.get_text(separator="\n", strip=True)
+                if txt and txt not in seen_desc_texts:
+                    seen_desc_texts.add(txt)
+                    description_blocks.append(txt)
+            elif "jobdetailtable" in c_lower or "jobdetail_" in c_lower:
+                lbl = c_lower.replace("jobdetailtable", "").replace("jobdetail_", "").strip()
+                # Split camelCase if present
+                lbl = re.sub(r'(?<!^)(?=[A-Z])', ' ', lbl).lower()
+                
+                txt = item.get_text(separator="\n", strip=True)
+                if "\n" in txt:
+                    parts = txt.split("\n", 1)
+                    val = parts[1].strip()
+                elif ":" in txt:
+                    parts = txt.split(":", 1)
+                    val = parts[1].strip()
+                else:
+                    val = txt
+                    
+                if lbl and val:
+                    metadata[lbl] = val
+
+    # --- Process Layout: elements with classes containing list-item- or list_item_ ---
+    for item in soup.find_all(class_=lambda x: x and any(k in x.lower() for k in ["list-item-", "list_item_"])):
+        cls_list = item.get("class")
+        for c in cls_list:
+            if "list-item-" in c or "list_item_" in c:
+                lbl = c.replace("list-item-", "").replace("list_item_", "").strip()
+                # Split camelCase
+                lbl = re.sub(r'(?<!^)(?=[A-Z])', ' ', lbl).lower()
+                val = item.text.strip()
+                if lbl and val:
+                    metadata[lbl] = val
+
+    # --- Process Layout: Sibling label/value pairs (e.g. class ends with label/value or contains it) ---
+    for lbl_elem in soup.find_all(class_=lambda x: x and any(k in x.lower() for k in ["label", "fieldlabel", "fieldsetlabel"])):
+        lbl_text = lbl_elem.text.strip().lower().replace(":", "").replace("#", "").strip()
+        if lbl_text and len(lbl_text) < 50:
+            val_elem = lbl_elem.find_next(class_=lambda x: x and any(k in x.lower() for k in ["value", "fieldvalue", "fieldsetvalue"]))
+            if val_elem:
+                val_text = val_elem.text.strip()
+                if val_text and lbl_text not in metadata:
+                    metadata[lbl_text] = val_text
+                    
+    # --- General Layout: view__field or fieldset ---
+    field_elements = soup.find_all(class_=lambda x: x and any(k in x.lower() for k in ["article__content__view__field", "fieldset"]))
     for field in field_elements:
-        label_elem = field.find(class_=lambda x: x and "label" in x.lower())
-        value_elem = field.find(class_=lambda x: x and "value" in x.lower())
-        if label_elem and value_elem:
-            lbl = label_elem.text.strip().lower().replace(":", "").replace("#", "").strip()
-            val = value_elem.text.strip()
+        lbl_elem = field.find(class_=lambda x: x and any(k in x.lower() for k in ["label", "fieldsetlabel"]))
+        val_elem = field.find(class_=lambda x: x and any(k in x.lower() for k in ["value", "fieldsetvalue"]))
+        
+        if lbl_elem and val_elem:
+            lbl = lbl_elem.text.strip().lower().replace(":", "").replace("#", "").strip()
+            val = val_elem.text.strip()
             if lbl and val:
                 metadata[lbl] = val
-                
-    # --- Layout 2: data-map="item-title" and data-map="item-value" (NVA / Standard) ---
+        elif val_elem:
+            val_text = val_elem.text.strip()
+            if len(val_text) > 80 and val_text not in seen_desc_texts:
+                if not any(k in val_text.lower() for k in ["apply now", "sign in", "skip to content"]):
+                    seen_desc_texts.add(val_text)
+                    description_blocks.append(val_text)
+                    
+    # --- Process Layout: NVA standard spans with data-map ---
     title_spans = soup.find_all(attrs={"data-map": "item-title"})
     for ts in title_spans:
         parent = ts.parent
@@ -183,114 +261,172 @@ def parse_job_details(html: str, job_url: str, domain: str):
                 val = val_elem.text.strip()
                 if lbl and val:
                     metadata[lbl] = val
-                    
-    # --- Layout 3: fieldSetLabel and fieldSetValue (Mettler Toledo / Standard) ---
-    fieldset_elements = soup.find_all(class_=lambda x: x and "fieldset" in x.lower())
-    for fs in fieldset_elements:
-        lbl_elem = fs.find(class_=lambda x: x and "label" in x.lower()) or fs.find(class_=lambda x: x and "fieldsetlabel" in x.lower())
-        val_elem = fs.find(class_=lambda x: x and "value" in x.lower()) or fs.find(class_=lambda x: x and "fieldsetvalue" in x.lower())
-        if lbl_elem and val_elem:
-            lbl = lbl_elem.text.strip().lower().replace(":", "").replace("#", "").strip()
-            val = val_elem.text.strip()
-            if lbl and val:
-                metadata[lbl] = val
-                
-    # Alternate Layout 3 Check
-    for label_elem in soup.find_all(class_=lambda x: x and "fieldsetlabel" in x.lower()):
-        parent = label_elem.parent
-        if parent:
-            value_elem = parent.find(class_=lambda x: x and "fieldsetvalue" in x.lower())
-            if value_elem:
-                lbl = label_elem.text.strip().lower().replace(":", "").replace("#", "").strip()
-                val = value_elem.text.strip()
-                if lbl and val:
-                    metadata[lbl] = val
-                    
-    # Normalize extracted metadata fields into standard schema columns
+
+    # --- Process Layout: Inline colons "Label: Value" in small text elements ---
+    for tag in soup.find_all(["p", "div", "span", "li"]):
+        txt = tag.text.strip()
+        if 0 < len(txt) < 200 and ":" in txt:
+            parts = txt.split(":", 1)
+            lbl = parts[0].strip().lower().strip()
+            val = parts[1].strip()
+            if lbl and val and len(lbl) < 40:
+                metadata_words = ["company", "position", "territory", "therapy", "vacancy", "location", "salary", "ref", "job id", "req", "department", "date", "contract", "hours", "shift"]
+                if any(w in lbl for w in metadata_words) or lbl in ["ref", "req", "id"]:
+                    if lbl not in metadata:
+                        metadata[lbl] = val
+
+    # --- Fallback: scan for any strong/b tags inside paragraphs that look like labels ---
+    if not metadata:
+        for p in soup.find_all("p"):
+            strong = p.find(["strong", "b"])
+            if strong:
+                lbl_text = strong.text.strip().lower().replace(":", "").strip()
+                full_text = p.text.strip()
+                strong_text = strong.text.strip()
+                if full_text.startswith(strong_text) and len(full_text) > len(strong_text):
+                    val_text = full_text[len(strong_text):].strip().strip("-").strip()
+                    if lbl_text and val_text and len(lbl_text) < 30 and len(val_text) < 150:
+                        metadata[lbl_text] = val_text
+
+    # 2. Extract Standard Schema Columns from Metadata
     location = "Unknown"
     posted_date = "Unknown"
     department = "Unknown"
     ref_id = "Unknown"
+    salary = "Unknown"
     
     location_parts = []
+    
     for lbl, val in metadata.items():
         lbl_clean = lbl.replace("_", " ").replace("-", " ").strip()
-        # Location mapping: combine 'city', 'state', 'country', 'site' into unified string
-        if lbl_clean in ["city", "state", "country", "location", "preferred location", "site", "place"]:
-            if val and val.lower() != "unknown" and val not in location_parts:
-                location_parts.append(val)
+        lbl_words = set(re.findall(r"\w+", lbl_clean))
+        
+        # Location mapping: city, state, country, location, site, place, workplace
+        if any(k in lbl_clean for k in ["city", "state", "province", "region", "country", "location", "preferred location", "site", "place", "facility", "hospital", "clinic", "office", "workplace", "advertising location"]):
+            if not any(k in lbl_clean for k in ["required", "qualification", "experience", "closing"]):
+                if val and val.lower() != "unknown" and val not in location_parts and len(val) < 100:
+                    location_parts.append(val)
+                    
         # Date mapping
-        elif any(k in lbl_clean for k in ["posted", "date", "created", "published"]):
-            posted_date = val
+        if any(k in lbl_words for k in ["posted", "date", "created", "published"]) or "date" in lbl_clean or lbl_clean == "apply by":
+            if not any(k in lbl_clean for k in ["closing", "close", "end"]):
+                if val and val.lower() != "unknown" and posted_date == "Unknown":
+                    clean_val = re.sub(r'(?i)apply\s+by\s+', '', val).strip()
+                    posted_date = clean_val
+            
         # Department mapping
-        elif any(k in lbl_clean for k in ["department", "business area", "division", "team", "function"]):
-            department = val
+        if any(k in lbl_clean for k in ["department", "business area", "business unit", "division", "team", "function", "category", "specialty", "discipline", "profession", "practice area", "career field", "job field", "career area", "subcategory", "domain", "therapy area"]):
+            if lbl_clean == "domain" and "." in val:
+                continue
+            if val and val.lower() != "unknown" and department == "Unknown":
+                department = val
+            
         # Ref ID mapping
-        elif any(k in lbl_clean for k in ["ref", "req", "id", "reference", "code"]):
-            ref_id = val
+        if any(w in lbl_words for w in ["ref", "req", "id", "code", "number"]) or any(k in lbl_clean for k in ["reference", "requisition", "job number"]):
+            if not any(k in lbl_clean for k in ["required", "requirement", "qualification", "experience"]):
+                if val and val.lower() != "unknown" and ref_id == "Unknown":
+                    ref_id = val
+                    
+        # Exact Ref ID matching
+        if lbl_clean in ["job", "job #", "job no", "req", "req #", "req no", "ref", "ref #", "ref no"]:
+            if val and val.lower() != "unknown" and ref_id == "Unknown":
+                ref_id = val
+
+        # Salary/Compensation mapping
+        if any(k in lbl_clean for k in ["salary", "compensation", "pay rate", "pay range", "remuneration", "hourly rate", "annual base salary", "starting pay", "pay rate"]):
+            if val and val.lower() != "unknown" and salary == "Unknown":
+                salary = val
 
     if location_parts:
         location = ", ".join(location_parts)
 
-    # Apply title cleaning helper to get pristine job title
+    # Fallback Ref ID from URL
+    if ref_id == "Unknown" or not ref_id:
+        parsed_url = urllib.parse.urlparse(job_url)
+        path_parts = [p for p in parsed_url.path.split("/") if p]
+        if path_parts:
+            last_part = path_parts[-1]
+            if re.match(r"^\d+$", last_part):
+                ref_id = last_part
+
+    # 3. Pull out the Job Title
+    title = "Unknown Title"
+    for k in ["job title", "title", "position", "role", "position title", "posting title - english", "posting job title"]:
+        if metadata.get(k):
+            title = metadata[k]
+            break
+            
+    if title == "Unknown Title" or not title:
+        title_tag = soup.find("title")
+        if title_tag:
+            title = title_tag.text.strip()
+            
+    if title == "Unknown Title" or not title:
+        h1_tag = soup.find("h1") or soup.find(class_=lambda x: x and "job-title" in x.lower())
+        if h1_tag:
+            title = h1_tag.text.strip()
+            
     title = clean_job_title(title, domain, ref_id, department)
 
-    # 3. Extract Clean Description
-    description_blocks = []
+    # 4. Construct Job Description
+    # Append values from metadata fields that represent descriptions/requirements/benefits
+    description_keywords = [
+        "description", "job description", "summary", "responsibilities", "requirements", 
+        "qualifications", "benefits", "highlights", "about the role", "about us", "our story", 
+        "what you'll do", "key responsibilities", "essential duties", "training and/or experience required",
+        "introduction", "intro", "tasks", "task", "profil", "profile", "aufgaben", "wir suchen", 
+        "what is in it for you", "you will need", "you will be responsible for", "about the team", 
+        "candidate profile", "experience required", "what we offer", "who you are", "ideal candidate",
+        "skills", "what we're looking for", "key duties", "essential skills"
+    ]
     
-    # A. Search for standard rich-text divs (Bloomberg / Standard)
-    rich_text_divs = soup.find_all("div", class_=lambda x: x and "field--rich-text" in x)
+    for lbl, val in metadata.items():
+        lbl_lower = lbl.lower()
+        if any(k in lbl_lower for k in description_keywords):
+            if len(val) > 5 and val not in seen_desc_texts:
+                seen_desc_texts.add(val)
+                description_blocks.append(val)
+                
+    rich_text_divs = soup.find_all(class_=lambda x: x and any(k in x.lower() for k in ["rich-text", "field--rich-text", "job-description", "job-body", "description-content", "jobdescription"]))
     for rtd in rich_text_divs:
         txt = rtd.get_text(separator="\n", strip=True)
-        if len(txt) > 50:
+        if len(txt) > 80 and txt not in seen_desc_texts:
+            seen_desc_texts.add(txt)
             description_blocks.append(txt)
-            
-    # B. If no rich text, search for article__content divs (NVA / Standard)
-    # Uses bs4 decomposition on a cloned element to dynamically strip metadata fields
+
+    # General fallback: check if we can get text from a central container
     if not description_blocks:
-        article_divs = soup.find_all("div", class_="article__content")
-        for ad in article_divs:
-            ad_copy = copy.copy(ad)
-            
-            # Decompose metadata fields within the description container
-            for meta_elem in ad_copy.find_all(class_=lambda x: x and any(k in x.lower() for k in ["label", "value", "view__field"])):
-                meta_elem.decompose()
-            for meta_elem in ad_copy.find_all(attrs={"data-map": ["item-title", "item-value"]}):
-                parent = meta_elem.parent
-                if parent and parent != ad_copy:
-                    parent.decompose()
-                else:
-                    meta_elem.decompose()
-                
-            txt = ad_copy.get_text(separator="\n", strip=True)
-            # Filter standard action buttons, headers, or social shares
-            if len(txt) > 100 and not any(k in txt.lower() for k in ["apply now", "save this job", "share this job"]):
+        body_content = soup.find("div", class_=lambda x: x and any(k in x.lower() for k in ["body__content", "main__content", "article__content", "jobdetailboxcontainter", "jobdetail"]))
+        if body_content:
+            body_copy = copy.copy(body_content)
+            # Decompose only labels
+            for small_elem in body_copy.find_all(class_=lambda x: x and any(k in x.lower() for k in ["label", "view__field__label", "fieldsetlabel"])):
+                small_elem.decompose()
+            txt = body_copy.get_text(separator="\n", strip=True)
+            # Clean up boilerplate navigation or footer terms
+            lines = [line.strip() for line in txt.split("\n")]
+            cleaned_lines = []
+            for line in lines:
+                if not line:
+                    continue
+                # Skip typical navigation lines
+                if any(nav in line.lower() for nav in ["skip to content", "go back", "apply now", "share this job", "cookie policy", "privacy policy"]):
+                    continue
+                cleaned_lines.append(line)
+            txt = "\n".join(cleaned_lines).strip()
+            if len(txt) > 100:
                 description_blocks.append(txt)
                 
-    # C. Search for Mettler Toledo style descriptions (fieldset where label matches description/requirements)
-    if not description_blocks:
-        fieldset_elements = soup.find_all(class_=lambda x: x and "fieldset" in x.lower())
-        for fs in fieldset_elements:
-            lbl_elem = fs.find(class_=lambda x: x and "label" in x.lower()) or fs.find(class_=lambda x: x and "fieldsetlabel" in x.lower())
-            val_elem = fs.find(class_=lambda x: x and "value" in x.lower()) or fs.find(class_=lambda x: x and "fieldsetvalue" in x.lower())
-            if lbl_elem and val_elem:
-                lbl = lbl_elem.text.strip().lower().replace(":", "").replace("#", "").strip()
-                if any(k in lbl for k in ["description", "responsibilities", "requirements", "profile", "what you will do", "what you need"]):
-                    txt = val_elem.get_text(separator="\n", strip=True)
-                    if len(txt) > 80 and txt not in description_blocks:
-                        description_blocks.append(txt)
-                        
-    # D. Final general fallback
-    if not description_blocks:
-        fallback_div = soup.find("div", class_="job-description") or soup.find("div", class_="job-body")
-        if fallback_div:
-            description_blocks.append(fallback_div.get_text(separator="\n", strip=True))
-            
     description = "\n\n".join(description_blocks).strip()
     if not description:
         description = "No description found"
 
-    import json
+    # Fallback Salary extraction from Description/HTML
+    if salary == "Unknown" or not salary:
+        salary = extract_salary_from_text(description)
+    if salary == "Unknown" or not salary:
+        salary = extract_salary_from_text(soup.text)
+
     return {
         "url": job_url,
         "domain": domain,
@@ -300,6 +436,7 @@ def parse_job_details(html: str, job_url: str, domain: str):
         "posted_date": posted_date,
         "department": department,
         "ref_id": ref_id,
+        "salary": salary,
         "raw_metadata": json.dumps(metadata, ensure_ascii=False),
         "raw_html": html
     }
@@ -338,8 +475,8 @@ async def scrape_job_html(session: aiohttp.ClientSession, semaphore: asyncio.Sem
                         # SQLite Upsert
                         cursor = db_conn.cursor()
                         cursor.execute('''
-                            INSERT OR REPLACE INTO jobs (url, domain, title, description, location, posted_date, department, ref_id, raw_metadata, raw_html)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT OR REPLACE INTO jobs (url, domain, title, description, location, posted_date, department, ref_id, salary, raw_metadata, raw_html)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             job_data["url"],
                             job_data["domain"],
@@ -349,6 +486,7 @@ async def scrape_job_html(session: aiohttp.ClientSession, semaphore: asyncio.Sem
                             job_data["posted_date"],
                             job_data["department"],
                             job_data["ref_id"],
+                            job_data["salary"],
                             job_data["raw_metadata"],
                             job_data["raw_html"]
                         ))

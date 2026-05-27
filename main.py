@@ -50,7 +50,7 @@ def export_data(db_path="avature_jobs.db", json_out="scraped_jobs.json", csv_out
     # 2. Fetch all jobs
     try:
         cursor.execute('''
-            SELECT url, raw_html FROM jobs
+            SELECT url, domain, title, location, posted_date, department, ref_id, salary, description, extracted_at FROM jobs
         ''')
         rows = cursor.fetchall()
         
@@ -58,7 +58,15 @@ def export_data(db_path="avature_jobs.db", json_out="scraped_jobs.json", csv_out
         for row in rows:
             job_list.append({
                 "url": row[0],
-                "raw_html": row[1]
+                "domain": row[1],
+                "title": row[2],
+                "location": row[3],
+                "posted_date": row[4],
+                "department": row[5],
+                "ref_id": row[6],
+                "salary": row[7],
+                "description": row[8],
+                "extracted_at": row[9]
             })
             
         # Write to JSON
@@ -70,11 +78,19 @@ def export_data(db_path="avature_jobs.db", json_out="scraped_jobs.json", csv_out
         try:
             with open(csv_out, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Application URL", "Raw HTML"])
+                writer.writerow(["Application URL", "Domain", "Job Title", "Location", "Posted Date", "Department", "Reference ID", "Salary", "Description", "Extracted At"])
                 for job in job_list:
                     writer.writerow([
                         job["url"],
-                        job["raw_html"]
+                        job["domain"],
+                        job["title"],
+                        job["location"],
+                        job["posted_date"],
+                        job["department"],
+                        job["ref_id"],
+                        job["salary"],
+                        job["description"],
+                        job["extracted_at"]
                     ])
             logger.info(f"Successfully exported {len(job_list)} jobs to clean CSV: '{csv_out}'")
         except PermissionError:
@@ -83,11 +99,19 @@ def export_data(db_path="avature_jobs.db", json_out="scraped_jobs.json", csv_out
             logger.warning(f"⚠️ Writing export data to fallback file instead: '{fallback_csv}'")
             with open(fallback_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Application URL", "Raw HTML"])
+                writer.writerow(["Application URL", "Domain", "Job Title", "Location", "Posted Date", "Department", "Reference ID", "Salary", "Description", "Extracted At"])
                 for job in job_list:
                     writer.writerow([
                         job["url"],
-                        job["raw_html"]
+                        job["domain"],
+                        job["title"],
+                        job["location"],
+                        job["posted_date"],
+                        job["department"],
+                        job["ref_id"],
+                        job["salary"],
+                        job["description"],
+                        job["extracted_at"]
                     ])
             logger.info(f"Successfully exported {len(job_list)} jobs to fallback CSV: '{fallback_csv}'")
         
